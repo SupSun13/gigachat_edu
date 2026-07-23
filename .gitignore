@@ -1,0 +1,11 @@
+.env
+body.json
+*.key
+
+__pycache__/
+venv/
+.venv/
+*pyc
+
+.log
+.DS_Store
