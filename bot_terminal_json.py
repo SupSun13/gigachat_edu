@@ -57,7 +57,7 @@ def parse_solution(text):
     raw = match.group(0) if match else text
     return Solution.model_validate_json(raw)
 
-def ask_gigachat(question):
+def ask_gigachat(messages):
     # Получаем ключ
     credentials = os.getenv("GIGACHAT_CREDENTIALS")
     if not credentials:
@@ -77,12 +77,9 @@ def ask_gigachat(question):
         
 
         # Отправляем запрос
-        history = [{"role": "system", "content": system_text}]
-        history += FEW_SHOT
-        history += [{"role": "user", "content": question}]
         chat = Chat(
             model="GigaChat-2",
-            messages = history,
+            messages = messages,
             temperature=1,
             max_tokens=1000,
         )
@@ -102,7 +99,8 @@ def main():
     print("🤖 GigaChat терминал")
     print("="*50)
     print("Введите 'exit' для выхода\n")
-    
+    history = [{"role": "system", "content": system_text}]
+    history += FEW_SHOT
     while True:
         question = input("👤 Вы: ").strip()
         
@@ -114,9 +112,11 @@ def main():
             print("❌ Пожалуйста, введите вопрос")
             continue
         
+        history.append({"role": "user", "content": question})
         print("🤖 GigaChat: ", end="")
-        text = ask_gigachat(question)
+        text = ask_gigachat(history)
         print(text)
+        history.append({"role": "assistant", "content": text})
         try:
             solution = parse_solution(text)
         except (ValidationError, ValueError, json.JSONDecodeError) as e:

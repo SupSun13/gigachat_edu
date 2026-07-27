@@ -129,6 +129,7 @@ def main():
             + conversation[1:][-MAX_HISTORY:]
             + [{'role': 'user', 'content': question}]
         )
+        print('Длина инпута в нейросеть:', len(messages))
         print("🤖 GigaChat: ", end="")
         # 3. вызываем модель
         text = ask_gigachat(messages)
