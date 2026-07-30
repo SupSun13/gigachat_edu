@@ -12,7 +12,7 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
 from dotenv import load_dotenv
 from gigachat import GigaChat
-from gigachat.models import Chat
+from gigachat.models import Chat, Messages
 from pydantic import BaseModel, Field, ValidationError
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -245,6 +245,31 @@ PHOTO_PROMPT = (
     'Если задачи на изображении нет, ответь ровно: НЕТ ЗАДАЧИ.'
 )
 
+# POST /files капризен к MIME: таблица в доках обещает audio/mp3,
+# но сервер отвечает 400 "File format audio/mp3 is not supported".
+# Поэтому пробуем кандидатов по очереди: стандартный тип первым, доковский — следом.
+AUDIO_MIME_CANDIDATES = {
+    'mp3': ['audio/mpeg', 'audio/mp3'],
+    'ogg': ['audio/ogg', 'audio/x-ogg', 'audio/opus'],  # голосовые ВК — opus в ogg-контейнере
+}
+IMAGE_MIME_CANDIDATES = ['image/jpeg']
+
+def upload_with_fallback(giga, raw, filename, mime_candidates):
+    """Загрузка файла с перебором MIME. «Не тот формат» — пробуем следующий кандидат,
+    любая другая ошибка (сеть, авторизация) — сразу наружу, перебором её не маскируем."""
+    last_err = None
+    for mime in mime_candidates:
+        try:
+            uploaded = giga.upload_file((filename, raw, mime), purpose="general")
+            logging.info('upload_ok | %s | %s', filename, mime)
+            return uploaded
+        except Exception as e:
+            if 'not supported' not in str(e).lower():
+                raise
+            logging.warning('upload_mime_rejected | %s | %s', mime, e)
+            last_err = e
+    raise last_err
+
 def extract_attachment(msg):
     """Первое поддерживаемое вложение сообщения.
     Возвращает ('photo', url) | ('voice', (url, duration)) | (None, None)."""
@@ -258,9 +283,10 @@ def extract_attachment(msg):
         elif att.get('type') == 'audio_message':
             am = att.get('audio_message', {})
             # у голосовых ВК две ссылки; mp3 надёжнее по MIME (в доках GigaChat — audio/mp3)
-            url = am.get('link_mp3') or am.get('link_ogg')
-            if url:
-                return 'voice', (url, am.get('duration', 0))
+            if am.get('link_mp3'):
+                return 'voice', (am['link_mp3'], am.get('duration', 0), 'mp3')
+            if am.get('link_ogg'):
+                return 'voice', (am['link_ogg'], am.get('duration', 0), 'ogg')
     return None, None
 
 def download(url, max_mb):
@@ -276,7 +302,7 @@ def download(url, max_mb):
         return None
     return resp.content
 
-def recognize_attachment(raw, filename, mime, prompt, audio=False):
+def recognize_attachment(raw, filename, mime_candidates, prompt, audio=False):
     """Файл -> хранилище GigaChat -> запрос с attachments -> удаление файла.
     Возвращает (распознанный текст, токены) или (None, 0)."""
     try:
@@ -288,8 +314,7 @@ def recognize_attachment(raw, filename, mime, prompt, audio=False):
             verify_ssl_certs=False,  # Для тестирования (в продакшене установите True)
             timeout=60,  # мультимодальные запросы заметно дольше текстовых
         ) as giga:
-            # кортеж (имя, байты, MIME) уходит в multipart как есть — так SDK передаёт его httpx
-            uploaded = giga.upload_file((filename, raw, mime), purpose="general")
+            uploaded = upload_with_fallback(giga, raw, filename, mime_candidates)
             try:
                 extra = {'function_call': 'auto'} if audio else {}  # так в примере доков для аудио
                 chat = Chat(
@@ -300,8 +325,19 @@ def recognize_attachment(raw, filename, mime, prompt, audio=False):
                 )
                 response = giga.chat(chat)
                 if not response.choices:
+                    logging.error('recognition_empty | no choices | %r', response)
                     return None, response.usage.total_tokens
-                return response.choices[0].message.content.strip(), response.usage.total_tokens
+                choice = response.choices[0]
+                text = (choice.message.content or '').strip()
+                if not text:
+                    # пустой ответ: причина видна по finish_reason
+                    # (function_call — модель ушла в функцию, blacklist — сработал цензор)
+                    logging.error(
+                        'recognition_empty | finish=%s | msg=%r',
+                        getattr(choice, 'finish_reason', '?'), choice.message,
+                    )
+                    print(f"⚠️  Пустой ответ распознавания, finish_reason={getattr(choice, 'finish_reason', '?')}")
+                return text or None, response.usage.total_tokens
             finally:
                 # файл нужен на один запрос, хранилище не мусорим
                 try:
@@ -309,15 +345,15 @@ def recognize_attachment(raw, filename, mime, prompt, audio=False):
                 except Exception:
                     pass
     except Exception as e:
-        print(f"❌ Ошибка распознавания вложения: {e}")
-        logging.error('recognition_error | %s', e)
+        print(f"❌ Ошибка распознавания вложения: {type(e).__name__}: {e}")
+        logging.exception('recognition_error')  # полный трейсбек — в bot.log
         return None, 0
 
 def process_attachment(vk, peer_id, kind, payload):
     """Скачать + распознать вложение. Про ошибки сами говорим пользователю.
     Возвращает (текст, токены) или (None, токены)."""
     if kind == 'voice':
-        url, duration = payload
+        url, duration, ext = payload
         if duration > MAX_VOICE_SEC:
             send_vk(vk, peer_id, f'Голосовые длиннее {MAX_VOICE_SEC} секунд не разбираю. Скажи короче или напиши текстом.')
             return None, 0
@@ -326,7 +362,8 @@ def process_attachment(vk, peer_id, kind, payload):
             send_vk(vk, peer_id, 'Не смог скачать голосовое. Пришли ещё раз.')
             return None, 0
         print("⏳ Расшифровка голосового через GigaChat...")
-        text, tokens = recognize_attachment(raw, 'voice.mp3', 'audio/mp3', VOICE_PROMPT, audio=True)
+        mimes = AUDIO_MIME_CANDIDATES.get(ext, [f'audio/{ext}'])
+        text, tokens = recognize_attachment(raw, f'voice.{ext}', mimes, VOICE_PROMPT, audio=True)
         if not text:
             send_vk(vk, peer_id, 'Не разобрал голосовое. Скажи чётче или напиши текстом.')
             return None, tokens
@@ -340,7 +377,7 @@ def process_attachment(vk, peer_id, kind, payload):
         send_vk(vk, peer_id, f'Не смог скачать фото (или оно больше {MAX_IMAGE_MB} МБ). Пришли ещё раз.')
         return None, 0
     print("⏳ Распознавание фото через GigaChat...")
-    text, tokens = recognize_attachment(raw, 'photo.jpg', 'image/jpeg', PHOTO_PROMPT)
+    text, tokens = recognize_attachment(raw, 'photo.jpg', IMAGE_MIME_CANDIDATES, PHOTO_PROMPT)
     if not text or 'НЕТ ЗАДАЧИ' in text.upper():
         send_vk(vk, peer_id, 'Не нашёл задачу на фото. Сними условие покрупнее или напиши текстом.')
         return None, tokens
@@ -576,6 +613,14 @@ def use_vk_ru(vk_session):
 
     vk_session.http.post = post
 
+def sdk_version():
+    """Версия установленного пакета gigachat — важна для вложений."""
+    try:
+        from importlib.metadata import version
+        return version('gigachat')
+    except Exception:
+        return 'неизвестно'
+
 def main():
     # Проверяем наличие переменных
     if not VK_TOKEN:
@@ -584,6 +629,11 @@ def main():
     if not GIGACHAT_API_KEY:
         print("❌ Ошибка: GIGACHAT_API_KEY не найден в .env файле!")
         return
+
+    # Вложения требуют свежий SDK: upload_file + поле attachments у сообщений
+    sdk_fields = getattr(Messages, 'model_fields', None) or getattr(Messages, '__fields__', {})
+    if not hasattr(GigaChat, 'upload_file') or 'attachments' not in sdk_fields:
+        print("⚠️  Твой gigachat SDK не умеет вложения. Обнови: pip install -U gigachat")
 
     # Инициализация VK
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
@@ -594,6 +644,7 @@ def main():
     print(f"📊 Группа ID: {GROUP_ID}")
     print(f"🌐 VK API: {VK_API_HOST}")
     print(f"🤖 Модель GigaChat: {GIGACHAT_MODEL} (текст) + {RECOGNITION_MODEL} (фото/голос)")
+    print(f"🧩 gigachat SDK: {sdk_version()}")
     print(f"📚 Корпус: {len(CORPUS)} кусков")
     print("Ожидание сообщений...")
     print("-" * 50)
