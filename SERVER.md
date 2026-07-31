@@ -248,7 +248,7 @@ ufw status
 
 ```bash
 su - bot
-git clone https://github.com/USER/REPO.git vkbot
+git clone https://github.com/SupSun13/gigachat_edu.git vkbot
 cd vkbot
 ```
 
